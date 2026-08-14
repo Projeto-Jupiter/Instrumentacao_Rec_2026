@@ -117,12 +117,21 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    int32_t raw_weight = HX711_Read();
+    /*int32_t raw_weight = HX711_Read();
 
     // Print the raw value to Tera Term
     printf("Raw Load Cell Value: %ld\r\n", raw_weight);
 
-    HAL_Delay(500); // Wait before reading again
+    HAL_Delay(500); // Wait before reading again*/
+	int32_t sum = 0;
+	int samples = 10;
+	for (int i = 0; i < samples; i++){
+		sum += HX711_Read();
+		HAL_Delay(5);
+	}
+	int32_t avg_value = sum / samples;
+	printf("Average value: %ld\r\n", avg_value);
+	HAL_Delay(500);
 
   /* USER CODE END WHILE */
 
