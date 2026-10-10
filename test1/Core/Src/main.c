@@ -7,6 +7,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <string.h>
 #include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
@@ -16,6 +17,26 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+// ---- Calibration -----------------------------------------------------------
+// HX711_SCALE is in counts per gram:
+//   grams   = (filtered_counts - offset) / HX711_SCALE
+//   force_N = grams / 1000 * g
+#define HX711_SCALE          9.009f      // counts / gram
+#define GRAVITY_MS2          9.80665f    // m/s^2
+#define GRAM_TO_NEWTON       (GRAVITY_MS2 / 1000.0f)
+
+// ---- Filtering --------------------------------------------------------------
+#define MEDIAN_N             5       // sliding median window (odd): kills spikes
+#define EMA_ALPHA            0.15f   // 0..1, smaller = smoother but slower
+
+// ---- Zeroing ----------------------------------------------------------------
+#define TARE_SAMPLES         20      // samples averaged for a manual/startup tare
+#define ZERO_DEADBAND_N      0.05f   // |force| below this prints as exactly 0
+#define AUTO_ZERO_ENABLE     1       // 1 = slowly track zero drift
+#define AUTO_ZERO_WINDOW_N   0.20f   // only track if reading is within +-this of zero
+#define AUTO_ZERO_RATE       0.02f   // how fast the offset follows (per sample)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -26,6 +47,16 @@
 ADC_HandleTypeDef hadc1;
 
 /* USER CODE BEGIN PV */
+// Set by CDC_Receive_FS() in usbd_cdc_if.c (see instructions)
+volatile uint8_t usb_rx_cmd = 0;
+
+static int32_t median_buf[MEDIAN_N];
+static int     median_count = 0;
+static int     median_idx   = 0;
+
+static float   offset_counts = 0.0f;
+static float   ema_value     = 0.0f;
+static int     ema_ready     = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -38,43 +69,123 @@ static void MX_ADC1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 int _write(int file, char *ptr, int len) {
-    CDC_Transmit_FS((uint8_t*)ptr, len);
+    // CDC_Transmit_FS returns USBD_BUSY if the previous packet isn't done yet
+    uint32_t t0 = HAL_GetTick();
+    while (CDC_Transmit_FS((uint8_t*)ptr, len) == USBD_BUSY) {
+        if (HAL_GetTick() - t0 > 20) break;
+    }
     return len;
 }
 
-int32_t HX711_Read(void) {
-    int32_t count = 0;
+// Returns 1 on success, 0 on timeout (HX711 not responding)
+int HX711_Read(int32_t *out) {
+    uint32_t t0 = HAL_GetTick();
 
     // Wait for the HX711 to be ready (DT goes low)
-    while(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) {}
+    while (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) {
+        if (HAL_GetTick() - t0 > 1000) return 0;
+    }
 
-    // Read 24 bits of data
-    for(int i = 0; i < 24; i++) {
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET); // SCK High
-        for(volatile int d=0; d<10; d++){} // tiny delay
+    uint32_t count = 0;
 
-        count = count << 1;
+    // SCK held high > 60 us puts the HX711 into power-down, so an interrupt
+    // (e.g. USB) in the middle of the read would corrupt it. Block IRQs briefly.
+    __disable_irq();
+
+    for (int i = 0; i < 24; i++) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);   // SCK High
+        for (volatile int d = 0; d < 10; d++) {}
+
+        count <<= 1;
 
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET); // SCK Low
-        for(volatile int d=0; d<10; d++){} // tiny delay
+        for (volatile int d = 0; d < 10; d++) {}
 
-        if(HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) {
+        if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) {
             count++;
         }
     }
 
-    // 25th pulse to set Channel A with Gain of 128
+    // 25th pulse: next conversion = Channel A, gain 128
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
-    for(volatile int d=0; d<10; d++){}
+    for (volatile int d = 0; d < 10; d++) {}
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
 
-    // The data is 24-bit two's complement. We must extend the sign bit to 32 bits.
-    if(count & 0x00800000) {
-        count |= 0xFF000000;
+    __enable_irq();
+
+    // 24-bit two's complement -> 32-bit signed
+    if (count & 0x00800000UL) {
+        count |= 0xFF000000UL;
     }
 
-    return count;
+    *out = (int32_t)count;
+    return 1;
 }
+
+// Median of the last MEDIAN_N samples (removes single-sample spikes)
+static int32_t Median_Push(int32_t sample) {
+    median_buf[median_idx] = sample;
+    median_idx = (median_idx + 1) % MEDIAN_N;
+    if (median_count < MEDIAN_N) median_count++;
+
+    int32_t tmp[MEDIAN_N];
+    memcpy(tmp, median_buf, sizeof(int32_t) * median_count);
+
+    // insertion sort (tiny array)
+    for (int i = 1; i < median_count; i++) {
+        int32_t key = tmp[i];
+        int j = i - 1;
+        while (j >= 0 && tmp[j] > key) {
+            tmp[j + 1] = tmp[j];
+            j--;
+        }
+        tmp[j + 1] = key;
+    }
+    return tmp[median_count / 2];
+}
+
+// Median -> exponential moving average (low-pass)
+static float Filter_Update(int32_t raw) {
+    float med = (float)Median_Push(raw);
+    if (!ema_ready) {
+        ema_value = med;
+        ema_ready = 1;
+    } else {
+        ema_value += EMA_ALPHA * (med - ema_value);
+    }
+    return ema_value;
+}
+
+static void Filter_Reset(void) {
+    median_count = 0;
+    median_idx   = 0;
+    ema_ready    = 0;
+}
+
+// Average TARE_SAMPLES readings and use that as the new zero.
+// Keep the load cell unloaded and still while this runs.
+static void Tare(void) {
+    int64_t sum = 0;
+    int n = 0;
+    for (int i = 0; i < TARE_SAMPLES; i++) {
+        int32_t v;
+        if (HX711_Read(&v)) {
+            sum += v;
+            n++;
+        }
+    }
+    if (n > 0) {
+        offset_counts = (float)((double)sum / (double)n);
+    }
+    Filter_Reset();
+}
+
+static float Force_Compute(float filtered_counts) {
+    float grams = (filtered_counts - offset_counts) / HX711_SCALE;
+    return grams * GRAM_TO_NEWTON;
+}
+
+static inline float absf_(float x) { return x < 0 ? -x : x; }
 /* USER CODE END 0 */
 
 /**
@@ -111,27 +222,55 @@ int main(void)
 
   // Give the USB port 1 second to connect to the PC before spamming data
   HAL_Delay(1000);
+
+  // Initial zero (load cell must be empty at power-up)
+  Tare();
+  printf("Ready. Send 't' (or 'z') to tare.\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /*int32_t raw_weight = HX711_Read();
+    // Manual tare from the PC keyboard
+    if (usb_rx_cmd == 't' || usb_rx_cmd == 'T' ||
+        usb_rx_cmd == 'z' || usb_rx_cmd == 'Z') {
+        usb_rx_cmd = 0;
+        Tare();
+        printf("Tared.\r\n");
+    } else {
+        usb_rx_cmd = 0;
+    }
 
-    // Print the raw value to Tera Term
-    printf("Raw Load Cell Value: %ld\r\n", raw_weight);
+    // One HX711 sample (blocks until ready: ~10 Hz with the default RATE pin)
+    int32_t raw;
+    if (!HX711_Read(&raw)) {
+        printf("HX711 timeout\r\n");
+        continue;
+    }
 
-    HAL_Delay(500); // Wait before reading again*/
-	int32_t sum = 0;
-	int samples = 10;
-	for (int i = 0; i < samples; i++){
-		sum += HX711_Read();
-		HAL_Delay(5);
-	}
-	int32_t avg_value = sum / samples;
-	printf("Average value: %ld\r\n", avg_value);
-	HAL_Delay(500);
+    float filtered = Filter_Update(raw);
+    float force_N  = Force_Compute(filtered);
+
+#if AUTO_ZERO_ENABLE
+    // Zero tracking: if the reading is very close to zero, assume it's drift
+    // and let the offset slowly follow it.
+    if (absf_(force_N) < AUTO_ZERO_WINDOW_N) {
+        offset_counts += AUTO_ZERO_RATE * (filtered - offset_counts);
+        force_N = Force_Compute(filtered);
+    }
+#endif
+
+    // Deadband: print a clean zero when unloaded
+    if (absf_(force_N) < ZERO_DEADBAND_N) {
+        force_N = 0.0f;
+    }
+
+    // Print without float printf (needs a linker flag on STM32CubeIDE):
+    // convert to millinewtons and format manually.
+    int32_t mN = (int32_t)(force_N * 1000.0f + (force_N >= 0 ? 0.5f : -0.5f));
+    long a = (mN < 0) ? -(long)mN : (long)mN;
+    printf("Force: %s%ld.%03ld N\r\n", (mN < 0) ? "-" : "", a / 1000, a % 1000);
 
   /* USER CODE END WHILE */
 
