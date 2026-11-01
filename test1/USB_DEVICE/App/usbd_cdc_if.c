@@ -261,8 +261,8 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-  extern volatile uint8_t usb_rx_cmd;       // <-- add
-  if (*Len > 0) usb_rx_cmd = Buf[0];        // <-- add
+  extern void App_OnUsbRx(const uint8_t *buf, uint32_t len);
+  App_OnUsbRx(Buf, *Len);
 
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
