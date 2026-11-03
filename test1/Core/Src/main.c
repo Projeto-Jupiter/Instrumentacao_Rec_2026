@@ -28,7 +28,7 @@ typedef struct {
 // Select the cell at runtime with keys '1'..'9' (or change DEFAULT_CELL).
 static const LoadCell_t load_cells[] = {
     { "Load cell 1", 9.009f },
-    { "Load cell 2", 0.0f   },   // TODO: calibrate and paste the factor
+	{ "Load cell 2", 44.9390f }, //7kg
     { "Load cell 3", 0.0f   },   // TODO: calibrate and paste the factor
 };
 #define NUM_CELLS            ((int)(sizeof(load_cells) / sizeof(load_cells[0])))
