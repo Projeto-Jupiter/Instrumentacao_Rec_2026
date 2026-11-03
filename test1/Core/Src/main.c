@@ -28,7 +28,7 @@ typedef struct {
 // Select the cell at runtime with keys '1'..'9' (or change DEFAULT_CELL).
 static const LoadCell_t load_cells[] = {
     { "Load cell 1", 9.009f },
-	{ "Load cell 2", 44.9390f }, //7kg
+	{ "Load cell 2", 44.9390f },   //7kg
     { "Load cell 3", 0.0f   },   // TODO: calibrate and paste the factor
 };
 #define NUM_CELLS            ((int)(sizeof(load_cells) / sizeof(load_cells[0])))
@@ -59,6 +59,9 @@ static const LoadCell_t load_cells[] = {
 // ---- Serial input -----------------------------------------------------------
 #define RX_BUF_SIZE          64
 
+// ---- Output -----------------------------------------------------------------
+#define PRINT_INTERVAL_MS    2000    // time between printed readings
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -75,6 +78,9 @@ static volatile uint16_t rx_head = 0;
 static volatile uint16_t rx_tail = 0;
 
 static int     streaming     = 0;      // 1 = print force readings continuously
+static uint32_t last_print_ms = 0;     // tick of the last printed reading
+static int32_t last_raw      = 0;      // latest raw HX711 value (for 'd' debug key)
+static float   last_filtered = 0.0f;   // latest filtered value (for 'd' debug key)
 static int     menu_shown    = 0;      // becomes 1 after the first key press
 static int     active_cell   = DEFAULT_CELL;
 static float   scale_cpg     = 1.0f;   // active scale factor, counts per gram
@@ -418,6 +424,7 @@ static void Print_Help(void) {
            "  1-%d    select load cell\r\n"
            "  l      list load cells\r\n"
            "  h      show this menu\r\n"
+           "  d      debug: raw counts, offset and scale (one line)\r\n"
            "(c, l, h and 1-%d pause the readings; press s to resume)\r\n",
            NUM_CELLS, NUM_CELLS);
 }
@@ -433,6 +440,13 @@ static void Handle_Key(uint8_t c) {
     switch (c) {
     case 's': case 'S':
         streaming = !streaming;
+        if (streaming) last_print_ms = HAL_GetTick() - PRINT_INTERVAL_MS;  // print right away
+        break;
+    case 'd': case 'D':
+        printf("raw=%ld filtered=%ld offset=%ld scale=",
+               (long)last_raw, (long)last_filtered, (long)offset_counts);
+        Print_Fixed(scale_cpg, 4);
+        printf(" counts/g\r\n");
         break;
     case 't': case 'T':
     case 'z': case 'Z':
@@ -530,6 +544,8 @@ int main(void)
 
     float filtered = Filter_Update(raw);
     float force_N  = Force_Compute(filtered);
+    last_raw      = raw;
+    last_filtered = filtered;
 
 #if AUTO_ZERO_ENABLE
     // Zero tracking: if the reading is very close to zero, assume it's drift
@@ -548,7 +564,8 @@ int main(void)
     // Print without float printf (needs a linker flag on STM32CubeIDE):
     // convert to millinewtons and format manually.
     // (Readings are always filtered/zero-tracked, but only printed when streaming.)
-    if (streaming) {
+    if (streaming && (HAL_GetTick() - last_print_ms) >= PRINT_INTERVAL_MS) {
+        last_print_ms = HAL_GetTick();
         int32_t mN = (int32_t)(force_N * 1000.0f + (force_N >= 0 ? 0.5f : -0.5f));
         long a = (mN < 0) ? -(long)mN : (long)mN;
         printf("Force: %s%ld.%03ld N\r\n", (mN < 0) ? "-" : "", a / 1000, a % 1000);
