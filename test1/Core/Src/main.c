@@ -74,6 +74,8 @@ static volatile uint8_t  rx_buf[RX_BUF_SIZE];
 static volatile uint16_t rx_head = 0;
 static volatile uint16_t rx_tail = 0;
 
+static int     streaming     = 0;      // 1 = print force readings continuously
+static int     menu_shown    = 0;      // becomes 1 after the first key press
 static int     active_cell   = DEFAULT_CELL;
 static float   scale_cpg     = 1.0f;   // active scale factor, counts per gram
 
@@ -347,9 +349,9 @@ static int Read_Number(float *out) {
 static void Calibrate(void) {
     uint8_t c;
 
-    printf("\r\n=== Calibration: %s ===\r\n", load_cells[active_cell].name);
-    printf("1) Remove all weight and keep the cell still.\r\n"
-           "   Press any key to zero (x = cancel)... ");
+    streaming = 0;
+    printf("\r\nCalibrating %s. Remove all weight, then press any key (x = cancel): ",
+           load_cells[active_cell].name);
     fflush(stdout);
 
     while (!Rx_Get(&c)) {}
@@ -358,12 +360,9 @@ static void Calibrate(void) {
         return;
     }
 
-    printf("\r\nZeroing...\r\n");
-    fflush(stdout);
     Tare();
 
-    printf("2) Place the known weight on the cell, then type its mass in\r\n"
-           "   grams and press Enter (x = cancel): ");
+    printf("\r\nPlace the weight, type its mass in grams + Enter (x = cancel): ");
     fflush(stdout);
 
     float grams;
@@ -372,7 +371,7 @@ static void Calibrate(void) {
         return;
     }
 
-    printf("\r\nMeasuring, keep everything still...\r\n");
+    printf("\r\nMeasuring, keep still... ");
     fflush(stdout);
 
     // Discard the readings right after placing the weight (settling),
@@ -383,74 +382,78 @@ static void Calibrate(void) {
     }
 
     float avg;
-    int32_t mn, mx;
-    int got = Average_Samples(CAL_AVG_SAMPLES, &avg, &mn, &mx);
+    int got = Average_Samples(CAL_AVG_SAMPLES, &avg, NULL, NULL);
     if (got < CAL_AVG_SAMPLES / 2) {
-        printf("HX711 not responding. Check wiring.\r\n");
+        printf("\r\nHX711 not responding. Check wiring.\r\n");
         return;
     }
 
     float delta = avg - offset_counts;
     if (absf_(delta) < CAL_MIN_DELTA_COUNTS) {
-        printf("Almost no change from zero (%ld counts). Is the weight on the cell\r\n"
-               "and the cell connected? Calibration aborted.\r\n", (long)delta);
+        printf("\r\nAlmost no change from zero (%ld counts). Is the weight on the cell?\r\n"
+               "Calibration aborted.\r\n", (long)delta);
         return;
     }
 
     float new_scale = delta / grams;
 
-    printf("\r\n--- Result ---\r\n");
-    printf("Scale factor : ");
-    Print_Fixed(new_scale, 4);
-    printf(" counts/g\r\n");
-    printf("Noise (p-p)  : %ld counts (about ", (long)(mx - mn));
-    Print_Fixed((float)(mx - mn) / absf_(new_scale), 3);
-    printf(" g)\r\n");
-
-    if (new_scale < 0.0f) {
-        printf("NOTE: negative value = signal polarity is inverted. Swap the\r\n"
-               "signal wires (A+ / A-) or keep the negative factor in the table.\r\n");
-    }
-
-    printf("Paste into load_cells[]: { \"%s\", ", load_cells[active_cell].name);
+    // The only result output: a line ready to paste into load_cells[]
+    printf("\r\n{ \"%s\", ", load_cells[active_cell].name);
     Print_Fixed(new_scale, 4);
     printf("f },\r\n");
 
     // Use the new value right away so it can be checked.
     scale_cpg = new_scale;
     Filter_Reset();
-    printf("Now using this factor for this session (not saved).\r\n"
-           "Remove the weight; press 't' to re-zero if needed.\r\n");
 }
 
 // ---------------- Keyboard commands ------------------------------------------
 static void Print_Help(void) {
+    printf("\r\n==== Load cell reader ====\r\n");
+    List_Cells();
     printf("Commands:\r\n"
+           "  s      start / stop printing readings\r\n"
            "  t / z  zero (tare)\r\n"
-           "  c      calibrate the scale factor of the active load cell\r\n"
+           "  c      calibrate the active load cell\r\n"
            "  1-%d    select load cell\r\n"
            "  l      list load cells\r\n"
-           "  h      this help\r\n", NUM_CELLS);
+           "  h      show this menu\r\n"
+           "(c, l, h and 1-%d pause the readings; press s to resume)\r\n",
+           NUM_CELLS, NUM_CELLS);
 }
 
 static void Handle_Key(uint8_t c) {
+    // The first key after power-up only opens the menu
+    if (!menu_shown) {
+        menu_shown = 1;
+        Print_Help();
+        return;
+    }
+
     switch (c) {
+    case 's': case 'S':
+        streaming = !streaming;
+        break;
     case 't': case 'T':
     case 'z': case 'Z':
         Tare();
         printf("Tared.\r\n");
         break;
     case 'c': case 'C':
+        streaming = 0;
         Calibrate();
         break;
     case 'l': case 'L':
+        streaming = 0;
         List_Cells();
         break;
     case 'h': case 'H': case '?':
+        streaming = 0;
         Print_Help();
         break;
     default:
         if (c >= '1' && c <= '9') {
+            streaming = 0;
             int idx = c - '1';
             if (idx < NUM_CELLS) Select_Cell(idx);
             else printf("No such load cell.\r\n");
@@ -497,13 +500,21 @@ int main(void)
 
   // Pick the default load cell and zero it (load cell must be empty at power-up)
   Select_Cell(DEFAULT_CELL);
-  Print_Help();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // Until the first key press, remind the user how to open the menu.
+    // (The terminal may have been opened after the board booted, so a
+    // one-time message at startup could be missed.)
+    static uint32_t last_hint = 0;
+    if (!menu_shown && (HAL_GetTick() - last_hint) >= 2000) {
+        last_hint = HAL_GetTick();
+        printf("Load cell reader ready. Press any key for the menu.\r\n");
+    }
+
     // Handle any keys typed in the terminal
     uint8_t key;
     while (Rx_Get(&key)) {
@@ -536,9 +547,12 @@ int main(void)
 
     // Print without float printf (needs a linker flag on STM32CubeIDE):
     // convert to millinewtons and format manually.
-    int32_t mN = (int32_t)(force_N * 1000.0f + (force_N >= 0 ? 0.5f : -0.5f));
-    long a = (mN < 0) ? -(long)mN : (long)mN;
-    printf("Force: %s%ld.%03ld N\r\n", (mN < 0) ? "-" : "", a / 1000, a % 1000);
+    // (Readings are always filtered/zero-tracked, but only printed when streaming.)
+    if (streaming) {
+        int32_t mN = (int32_t)(force_N * 1000.0f + (force_N >= 0 ? 0.5f : -0.5f));
+        long a = (mN < 0) ? -(long)mN : (long)mN;
+        printf("Force: %s%ld.%03ld N\r\n", (mN < 0) ? "-" : "", a / 1000, a % 1000);
+    }
 
   /* USER CODE END WHILE */
 
