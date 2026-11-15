@@ -1,13 +1,5 @@
-[README (2).md](https://github.com/user-attachments/files/34886770/README.2.md)
-[README.md](https://github.com/user-attachments/files/34886751/README.md)
+[README (2).md](https://github.com/user-attachments/files/34886863/README.2.md)
 # Load cell reader (HX711 + STM32 Black Pill)
-
-Measures force with a load cell, an HX711 amplifier and an STM32 Black Pill (STM32F411CE),
-and shows it live in a desktop app on the PC. Built to measure the drag of a parachute
-(force in newtons, then `Cd = 2F / (rho * v^2 * A)`).
-
-- **Firmware** (`firmware/`): reads the HX711, filters the signal, zeroes it, converts to newtons
-  and talks to the PC over USB (virtual COM port) using simple text commands.# Load cell reader (HX711 + STM32 Black Pill)
 
 Measures force with a load cell, an HX711 amplifier and an STM32 Black Pill (STM32F411CE),
 and shows it live in a desktop app on the PC. Built to measure the drag of a parachute
@@ -401,6 +393,3 @@ git push
   `git rm -r --cached <folder>/.venv`, then commit.
 - The saved calibrations live in your user folder (`.loadcell_app.json`), so they are never committed.
 - Add your own measurement CSVs to the repository only if you want to share them.
-
-- **App** (`app/`): Python window with live plot, zero button, load cell selector,
-  calibration wizard, CSV recording and a drag coefficient calculator.
