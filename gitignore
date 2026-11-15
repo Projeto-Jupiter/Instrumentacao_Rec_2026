@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# STM32CubeIDE build output
+Debug/
+Release/
+*.o
+*.elf
+*.map
+*.su
+*.d
+
+# Operating system / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
