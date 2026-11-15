@@ -9,13 +9,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <ctype.h>
 #include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef struct {
-    const char *name;
+    const char *name;        // no commas allowed (they separate protocol fields)
     float counts_per_gram;   // 0.0f = not calibrated yet
 } LoadCell_t;
 /* USER CODE END PTD */
@@ -23,13 +25,16 @@ typedef struct {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define FW_VERSION           "2.0"
+
 // ---- Load cells -------------------------------------------------------------
-// After running the calibration ('c') for a cell, paste the printed value here.
-// Select the cell at runtime with keys '1'..'9' (or change DEFAULT_CELL).
+// Factors in counts per gram. The PC app remembers its own calibrations and
+// sends them back with SCALE after every reset, so editing this table is only
+// needed if you also want the firmware to start with the right value.
 static const LoadCell_t load_cells[] = {
-    { "Load cell 1", 9.009f },
-	{ "Load cell 2", 44.9390f },   //7kg
-    { "Load cell 3", 0.0f   },   // TODO: calibrate and paste the factor
+    { "Load cell 1", 9.4076f},
+    { "Load cell 2", 0.0f   },   // not calibrated yet
+    { "Load cell 3", 0.0f   },   // not calibrated yet
 };
 #define NUM_CELLS            ((int)(sizeof(load_cells) / sizeof(load_cells[0])))
 #define DEFAULT_CELL         0       // index in the table above (0 = first)
@@ -45,9 +50,9 @@ static const LoadCell_t load_cells[] = {
 #define EMA_ALPHA            0.15f   // 0..1, smaller = smoother but slower
 
 // ---- Zeroing ----------------------------------------------------------------
-#define TARE_SAMPLES         20      // samples averaged for a manual/startup tare
-#define ZERO_DEADBAND_N      0.05f   // |force| below this prints as exactly 0
-#define AUTO_ZERO_ENABLE     1       // 1 = slowly track zero drift
+#define TARE_SAMPLES         20      // samples averaged for a tare (~2 s at 10 SPS)
+#define ZERO_DEADBAND_N      0.05f   // |force| below this is reported as exactly 0
+#define AUTO_ZERO_ENABLE     1       // default state of the auto-zero (AUTOZERO cmd)
 #define AUTO_ZERO_WINDOW_N   0.20f   // only track if reading is within +-this of zero
 #define AUTO_ZERO_RATE       0.02f   // how fast the offset follows (per sample)
 
@@ -56,11 +61,18 @@ static const LoadCell_t load_cells[] = {
 #define CAL_AVG_SAMPLES      100     // samples averaged (~10 s at 10 SPS)
 #define CAL_MIN_DELTA_COUNTS 50      // smaller change than this = weight not detected
 
-// ---- Serial input -----------------------------------------------------------
-#define RX_BUF_SIZE          64
+// ---- HX711 limits -----------------------------------------------------------
+// A reading stuck at either limit means the input is out of range (overload,
+// bad wiring, floating input, unbalanced bridge): the value is meaningless.
+#define HX711_SAT_HI         8388607
+#define HX711_SAT_LO         (-8388608)
 
-// ---- Output -----------------------------------------------------------------
-#define PRINT_INTERVAL_MS    2000    // time between printed readings
+// ---- Serial protocol --------------------------------------------------------
+#define RX_BUF_SIZE          256
+#define LINE_MAX_LEN         64
+#define DEFAULT_INTERVAL_MS  2000    // time between F lines until INTERVAL is sent
+#define INTERVAL_MIN_MS      100
+#define INTERVAL_MAX_MS      60000
 
 /* USER CODE END PD */
 
@@ -72,26 +84,41 @@ static const LoadCell_t load_cells[] = {
 ADC_HandleTypeDef hadc1;
 
 /* USER CODE BEGIN PV */
+extern USBD_HandleTypeDef hUsbDeviceFS;
+
 // USB receive ring buffer, filled from CDC_Receive_FS() (USB interrupt)
 static volatile uint8_t  rx_buf[RX_BUF_SIZE];
 static volatile uint16_t rx_head = 0;
 static volatile uint16_t rx_tail = 0;
 
-static int     streaming     = 0;      // 1 = print force readings continuously
-static uint32_t last_print_ms = 0;     // tick of the last printed reading
-static int32_t last_raw      = 0;      // latest raw HX711 value (for 'd' debug key)
-static float   last_filtered = 0.0f;   // latest filtered value (for 'd' debug key)
-static int     menu_shown    = 0;      // becomes 1 after the first key press
-static int     active_cell   = DEFAULT_CELL;
-static float   scale_cpg     = 1.0f;   // active scale factor, counts per gram
+// Command line being assembled from the received bytes
+static char line_buf[LINE_MAX_LEN];
+static int  line_len      = 0;
+static int  line_overflow = 0;
 
-static int32_t median_buf[MEDIAN_N];
-static int     median_count = 0;
-static int     median_idx   = 0;
+// USB transmit buffer. CDC_Transmit_FS() does not copy the data, so the bytes
+// must stay untouched until the transfer finishes.
+static uint8_t tx_buf[256];
+static int     tx_stalled = 0;       // host is not reading: drop output, don't wait
 
-static float   offset_counts = 0.0f;
-static float   ema_value     = 0.0f;
-static int     ema_ready     = 0;
+static int      streaming     = 0;   // 1 = send F lines
+static uint32_t interval_ms   = DEFAULT_INTERVAL_MS;
+static uint32_t last_print_ms = 0;
+static int      autozero_on   = AUTO_ZERO_ENABLE;
+static int      cal_hold      = 0;   // 1 between "CAL ZERO" and "CAL <grams>"
+static int      got_command   = 0;   // stops the "ready" reminder
+static int      active_cell   = DEFAULT_CELL;
+static float    cell_scale[NUM_CELLS];   // runtime factors, counts per gram
+static float    scale_cpg     = 1.0f;    // factor of the active cell
+
+static int32_t  last_raw      = 0;
+static int32_t  median_buf[MEDIAN_N];
+static int      median_count  = 0;
+static int      median_idx    = 0;
+
+static float    offset_counts = 0.0f;
+static float    ema_value     = 0.0f;
+static int      ema_ready     = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -103,13 +130,61 @@ static void MX_ADC1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// ---------------- USB output -------------------------------------------------
+static int Cdc_Busy(void) {
+    USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
+    return (hcdc == NULL) || (hcdc->TxState != 0);
+}
+
+// Called by printf() and by Tx_Line()
 int _write(int file, char *ptr, int len) {
-    // CDC_Transmit_FS returns USBD_BUSY if the previous packet isn't done yet
-    uint32_t t0 = HAL_GetTick();
-    while (CDC_Transmit_FS((uint8_t*)ptr, len) == USBD_BUSY) {
-        if (HAL_GetTick() - t0 > 20) break;
+    int sent = 0;
+    while (sent < len) {
+        uint32_t t0 = HAL_GetTick();
+        while (Cdc_Busy()) {
+            if (tx_stalled) return len;                 // nobody is listening
+            if (HAL_GetTick() - t0 > 50) { tx_stalled = 1; return len; }
+        }
+        tx_stalled = 0;
+
+        int chunk = len - sent;
+        if (chunk > (int)sizeof(tx_buf)) chunk = (int)sizeof(tx_buf);
+        memcpy(tx_buf, ptr + sent, (size_t)chunk);
+        if (CDC_Transmit_FS(tx_buf, (uint16_t)chunk) != USBD_OK) return len;
+        sent += chunk;
     }
     return len;
+}
+
+// Sends one complete line ("...\r\n") in a single USB transfer
+static void Tx_Line(const char *fmt, ...) {
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof(buf) - 3) n = (int)sizeof(buf) - 3;
+    buf[n++] = '\r';
+    buf[n++] = '\n';
+    _write(1, buf, n);
+}
+
+// Formats a float with fixed decimals (newlib-nano has no float printf)
+static void Fmt_Fixed(char *out, size_t n, float v, int decimals) {
+    long p = 1;
+    for (int i = 0; i < decimals; i++) p *= 10;
+
+    int neg = (v < 0);
+    if (neg) v = -v;
+
+    long whole = (long)v;
+    long frac  = (long)((v - (float)whole) * (float)p + 0.5f);
+    if (frac >= p) { whole++; frac -= p; }
+    if (whole == 0 && frac == 0) neg = 0;      // never print "-0.000"
+
+    snprintf(out, n, "%s%ld.%0*ld", neg ? "-" : "", whole, decimals, frac);
 }
 
 static inline float absf_(float x) { return x < 0 ? -x : x; }
@@ -131,28 +206,6 @@ static int Rx_Get(uint8_t *c) {
     *c = rx_buf[rx_tail];
     rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
     return 1;
-}
-
-// Prints a float with a fixed number of decimals (no float printf needed)
-static void Print_Fixed(float v, int decimals) {
-    long p = 1;
-    for (int i = 0; i < decimals; i++) p *= 10;
-
-    int neg = (v < 0);
-    if (neg) v = -v;
-
-    long whole = (long)v;
-    long frac  = (long)((v - (float)whole) * (float)p + 0.5f);
-    if (frac >= p) { whole++; frac -= p; }
-
-    char digits[8];
-    for (int i = decimals - 1; i >= 0; i--) {
-        digits[i] = (char)('0' + (frac % 10));
-        frac /= 10;
-    }
-    digits[decimals] = '\0';
-
-    printf("%s%ld.%s", neg ? "-" : "", whole, digits);
 }
 
 // ---------------- HX711 ------------------------------------------------------
@@ -231,7 +284,7 @@ static int32_t Median_Push(int32_t sample) {
     if (median_count < MEDIAN_N) median_count++;
 
     int32_t tmp[MEDIAN_N];
-    memcpy(tmp, median_buf, sizeof(int32_t) * median_count);
+    memcpy(tmp, median_buf, sizeof(int32_t) * (size_t)median_count);
 
     // insertion sort (tiny array)
     for (int i = 1; i < median_count; i++) {
@@ -265,14 +318,23 @@ static void Filter_Reset(void) {
 }
 
 // ---------------- Zero / force -----------------------------------------------
+enum { TARE_OK = 0, TARE_SATURATED = 1, TARE_NO_HX711 = 2 };
+
 // Average TARE_SAMPLES readings and use that as the new zero.
 // Keep the load cell unloaded and still while this runs.
-static void Tare(void) {
+static int Tare(void) {
     float avg;
-    if (Average_Samples(TARE_SAMPLES, &avg, NULL, NULL) > 0) {
-        offset_counts = avg;
-    }
+    int32_t mn, mx;
+    int n = Average_Samples(TARE_SAMPLES, &avg, &mn, &mx);
+    if (n <= 0) return TARE_NO_HX711;
+    offset_counts = avg;
     Filter_Reset();
+    if (mx >= HX711_SAT_HI || mn <= HX711_SAT_LO) return TARE_SATURATED;
+    return TARE_OK;
+}
+
+static const char *Tare_Reason(int rc) {
+    return (rc == TARE_SATURATED) ? "SATURATED" : "NO_HX711";
 }
 
 static float Force_Compute(float filtered_counts) {
@@ -281,198 +343,215 @@ static float Force_Compute(float filtered_counts) {
 }
 
 // ---------------- Load cell selection ----------------------------------------
-static void List_Cells(void) {
-    printf("Load cells:\r\n");
-    for (int i = 0; i < NUM_CELLS; i++) {
-        printf("  %s%d: %s  ", (i == active_cell) ? "*" : " ", i + 1, load_cells[i].name);
-        if (load_cells[i].counts_per_gram > 0.0f) {
-            Print_Fixed(load_cells[i].counts_per_gram, 4);
-            printf(" counts/g\r\n");
-        } else {
-            printf("(not calibrated)\r\n");
-        }
-    }
-}
-
-static void Select_Cell(int idx) {
-    active_cell = idx;
-    float s = load_cells[idx].counts_per_gram;
-
-    if (s > 0.0f) {
-        scale_cpg = s;
-    } else {
-        scale_cpg = 1.0f;
-        printf("WARNING: this cell has no scale factor yet. Using 1.0 counts/g\r\n"
-               "(output is NOT in real units). Press 'c' to calibrate it.\r\n");
-    }
-
-    printf("Active: %s, scale ", load_cells[idx].name);
-    Print_Fixed(scale_cpg, 4);
-    printf(" counts/g\r\nKeep it unloaded, zeroing...\r\n");
-    fflush(stdout);
-
-    Tare();
-    printf("Done.\r\n");
+static void Apply_Scale(int idx) {
+    scale_cpg = (cell_scale[idx] != 0.0f) ? cell_scale[idx] : 1.0f;
 }
 
 // ---------------- Calibration ------------------------------------------------
-// Reads a number typed on the keyboard, finished with Enter.
-// Returns 1 on success, 0 if cancelled with 'x'.
-static int Read_Number(float *out) {
-    char line[16];
-    int len = 0;
-    uint8_t c;
+// The load cell must already be zeroed with "CAL ZERO" and the known mass placed.
+static void Calibrate(float grams) {
+    char sbuf[24];
+    streaming = 0;      // the stream stays off afterwards; the app restarts it
+    cal_hold  = 0;
 
-    for (;;) {
-        while (!Rx_Get(&c)) {}
+    int total = CAL_SETTLE_SAMPLES + CAL_AVG_SAMPLES;
+    int last_pct = -5, fail_streak = 0;
+    int64_t sum = 0;
+    int got = 0;
+    int32_t lo = 0, hi = 0;
 
-        if (c == 'x' || c == 'X') return 0;
-
-        if (c == '\r' || c == '\n') {
-            if (len > 0) break;           // ignore an empty Enter
-            continue;
+    for (int i = 0; i < total; i++) {
+        int32_t v;
+        if (!HX711_Read(&v)) {
+            if (++fail_streak >= 3) { Tx_Line("ERR,CAL,NO_HX711"); return; }
+        } else {
+            fail_streak = 0;
+            if (i >= CAL_SETTLE_SAMPLES) {          // discard the settling samples
+                if (got == 0 || v < lo) lo = v;
+                if (got == 0 || v > hi) hi = v;
+                sum += v;
+                got++;
+            }
         }
-
-        if ((c == 8 || c == 127) && len > 0) {   // backspace
-            len--;
-            printf("\b \b");
-            fflush(stdout);
-            continue;
-        }
-
-        if (((c >= '0' && c <= '9') || c == '.') && len < (int)sizeof(line) - 1) {
-            line[len++] = (char)c;
-            printf("%c", c);              // echo
-            fflush(stdout);
+        int pct = (i + 1) * 100 / total;
+        if (pct >= last_pct + 5 && pct < 100) {
+            Tx_Line("CAL,PROGRESS,%d", pct);
+            last_pct = pct;
         }
     }
 
-    line[len] = '\0';
-    *out = strtof(line, NULL);
+    if (got < CAL_AVG_SAMPLES / 2) { Tx_Line("ERR,CAL,NO_HX711"); return; }
+    if (hi >= HX711_SAT_HI || lo <= HX711_SAT_LO) { Tx_Line("ERR,CAL,SATURATED"); return; }
+
+    float avg   = (float)((double)sum / (double)got);
+    float delta = avg - offset_counts;
+    if (absf_(delta) < CAL_MIN_DELTA_COUNTS) { Tx_Line("ERR,CAL,NO_WEIGHT"); return; }
+
+    float new_scale = delta / grams;
+    cell_scale[active_cell] = new_scale;
+    scale_cpg = new_scale;
+    Filter_Reset();
+
+    Fmt_Fixed(sbuf, sizeof(sbuf), new_scale, 4);
+    Tx_Line("CAL,PROGRESS,100");
+    Tx_Line("OK,CAL,RESULT,%d,%s,%ld", active_cell + 1, sbuf, (long)(hi - lo));
+}
+
+// ---------------- Command parser ---------------------------------------------
+static int Parse_Float(const char *s, float *out) {
+    char *end;
+    float v = strtof(s, &end);
+    if (end == s || *end != '\0' || v != v || v > 1e9f || v < -1e9f) return 0;
+    *out = v;
     return 1;
 }
 
-static void Calibrate(void) {
-    uint8_t c;
-
-    streaming = 0;
-    printf("\r\nCalibrating %s. Remove all weight, then press any key (x = cancel): ",
-           load_cells[active_cell].name);
-    fflush(stdout);
-
-    while (!Rx_Get(&c)) {}
-    if (c == 'x' || c == 'X') {
-        printf("\r\nCancelled.\r\n");
-        return;
-    }
-
-    Tare();
-
-    printf("\r\nPlace the weight, type its mass in grams + Enter (x = cancel): ");
-    fflush(stdout);
-
-    float grams;
-    if (!Read_Number(&grams) || grams <= 0.0f) {
-        printf("\r\nCancelled or invalid weight.\r\n");
-        return;
-    }
-
-    printf("\r\nMeasuring, keep still... ");
-    fflush(stdout);
-
-    // Discard the readings right after placing the weight (settling),
-    // then average a long block for a low-noise result.
-    for (int i = 0; i < CAL_SETTLE_SAMPLES; i++) {
-        int32_t dummy;
-        HX711_Read(&dummy);
-    }
-
-    float avg;
-    int got = Average_Samples(CAL_AVG_SAMPLES, &avg, NULL, NULL);
-    if (got < CAL_AVG_SAMPLES / 2) {
-        printf("\r\nHX711 not responding. Check wiring.\r\n");
-        return;
-    }
-
-    float delta = avg - offset_counts;
-    if (absf_(delta) < CAL_MIN_DELTA_COUNTS) {
-        printf("\r\nAlmost no change from zero (%ld counts). Is the weight on the cell?\r\n"
-               "Calibration aborted.\r\n", (long)delta);
-        return;
-    }
-
-    float new_scale = delta / grams;
-
-    // The only result output: a line ready to paste into load_cells[]
-    printf("\r\n{ \"%s\", ", load_cells[active_cell].name);
-    Print_Fixed(new_scale, 4);
-    printf("f },\r\n");
-
-    // Use the new value right away so it can be checked.
-    scale_cpg = new_scale;
-    Filter_Reset();
-}
-
-// ---------------- Keyboard commands ------------------------------------------
 static void Print_Help(void) {
-    printf("\r\n==== Load cell reader ====\r\n");
-    List_Cells();
-    printf("Commands:\r\n"
-           "  s      start / stop printing readings\r\n"
-           "  t / z  zero (tare)\r\n"
-           "  c      calibrate the active load cell\r\n"
-           "  1-%d    select load cell\r\n"
-           "  l      list load cells\r\n"
-           "  h      show this menu\r\n"
-           "  d      debug: raw counts, offset and scale (one line)\r\n"
-           "(c, l, h and 1-%d pause the readings; press s to resume)\r\n",
-           NUM_CELLS, NUM_CELLS);
+    Tx_Line("# Load cell reader v%s. Commands (type, then Enter):", FW_VERSION);
+    Tx_Line("#  PING                  check the connection");
+    Tx_Line("#  STREAM 1|0            start / stop the F,<ms>,<N> readings");
+    Tx_Line("#  INTERVAL <ms>         time between readings (100..60000)");
+    Tx_Line("#  TARE                  zero (cell must be unloaded)");
+    Tx_Line("#  AUTOZERO 1|0          slow zero tracking on / off");
+    Tx_Line("#  CELLS                 list the load cells");
+    Tx_Line("#  CELL <n>              select load cell n (and zero it)");
+    Tx_Line("#  SCALE <n> <c/g>       set the factor of cell n until reset");
+    Tx_Line("#  CAL ZERO              calibration step 1: zero, cell empty");
+    Tx_Line("#  CAL <grams>           calibration step 2: known mass placed");
+    Tx_Line("#  CAL CANCEL            abort a calibration");
+    Tx_Line("#  STATUS                one-line status");
 }
 
-static void Handle_Key(uint8_t c) {
-    // The first key after power-up only opens the menu
-    if (!menu_shown) {
-        menu_shown = 1;
-        Print_Help();
-        return;
-    }
+static void Process_Line(char *line) {
+    char sbuf[24];
+    char *argv[4];
+    int argc = 0;
 
-    switch (c) {
-    case 's': case 'S':
-        streaming = !streaming;
-        if (streaming) last_print_ms = HAL_GetTick() - PRINT_INTERVAL_MS;  // print right away
-        break;
-    case 'd': case 'D':
-        printf("raw=%ld filtered=%ld offset=%ld scale=",
-               (long)last_raw, (long)last_filtered, (long)offset_counts);
-        Print_Fixed(scale_cpg, 4);
-        printf(" counts/g\r\n");
-        break;
-    case 't': case 'T':
-    case 'z': case 'Z':
-        Tare();
-        printf("Tared.\r\n");
-        break;
-    case 'c': case 'C':
-        streaming = 0;
-        Calibrate();
-        break;
-    case 'l': case 'L':
-        streaming = 0;
-        List_Cells();
-        break;
-    case 'h': case 'H': case '?':
-        streaming = 0;
+    for (char *p = line; *p; p++) *p = (char)toupper((unsigned char)*p);
+    for (char *tok = strtok(line, " ,\t"); tok && argc < 4; tok = strtok(NULL, " ,\t")) {
+        argv[argc++] = tok;
+    }
+    if (argc == 0) return;
+
+    got_command = 1;
+    const char *cmd = argv[0];
+
+    if (!strcmp(cmd, "PING")) {
+        Tx_Line("OK,PING,%s", FW_VERSION);
+
+    } else if (!strcmp(cmd, "HELP") || !strcmp(cmd, "?")) {
         Print_Help();
-        break;
-    default:
-        if (c >= '1' && c <= '9') {
-            streaming = 0;
-            int idx = c - '1';
-            if (idx < NUM_CELLS) Select_Cell(idx);
-            else printf("No such load cell.\r\n");
+        Tx_Line("OK,HELP");
+
+    } else if (!strcmp(cmd, "STREAM")) {
+        if (argc < 2 || (argv[1][0] != '0' && argv[1][0] != '1') || argv[1][1] != '\0') {
+            Tx_Line("ERR,STREAM,ARG");
+            return;
         }
-        break;   // anything else (Enter, etc.) is ignored
+        streaming = (argv[1][0] == '1');
+        if (streaming) last_print_ms = HAL_GetTick() - interval_ms;   // first line now
+        Tx_Line("OK,STREAM,%d", streaming);
+
+    } else if (!strcmp(cmd, "INTERVAL")) {
+        float v;
+        if (argc < 2 || !Parse_Float(argv[1], &v)) { Tx_Line("ERR,INTERVAL,ARG"); return; }
+        if (v < INTERVAL_MIN_MS || v > INTERVAL_MAX_MS) { Tx_Line("ERR,INTERVAL,RANGE"); return; }
+        interval_ms = (uint32_t)v;
+        Tx_Line("OK,INTERVAL,%lu", (unsigned long)interval_ms);
+
+    } else if (!strcmp(cmd, "AUTOZERO")) {
+        if (argc < 2 || (argv[1][0] != '0' && argv[1][0] != '1') || argv[1][1] != '\0') {
+            Tx_Line("ERR,AUTOZERO,ARG");
+            return;
+        }
+        autozero_on = (argv[1][0] == '1');
+        Tx_Line("OK,AUTOZERO,%d", autozero_on);
+
+    } else if (!strcmp(cmd, "TARE")) {
+        int rc = Tare();
+        if (rc == TARE_OK) Tx_Line("OK,TARE");
+        else               Tx_Line("ERR,TARE,%s", Tare_Reason(rc));
+
+    } else if (!strcmp(cmd, "CELLS")) {
+        for (int i = 0; i < NUM_CELLS; i++) {
+            Fmt_Fixed(sbuf, sizeof(sbuf), cell_scale[i], 4);
+            Tx_Line("CELL,%d,%s,%s,%d", i + 1, load_cells[i].name, sbuf, i == active_cell);
+        }
+        Tx_Line("OK,CELLS,%d", NUM_CELLS);
+
+    } else if (!strcmp(cmd, "CELL")) {
+        float v;
+        if (argc < 2 || !Parse_Float(argv[1], &v)) { Tx_Line("ERR,CELL,ARG"); return; }
+        int n = (int)v;
+        if (n < 1 || n > NUM_CELLS) { Tx_Line("ERR,CELL,RANGE"); return; }
+        active_cell = n - 1;
+        cal_hold = 0;
+        Apply_Scale(active_cell);
+        if (cell_scale[active_cell] == 0.0f) Tx_Line("W,UNCALIBRATED,%d", n);
+        int rc = Tare();
+        if (rc != TARE_OK) { Tx_Line("ERR,CELL,%s", Tare_Reason(rc)); return; }
+        Fmt_Fixed(sbuf, sizeof(sbuf), cell_scale[active_cell], 4);
+        Tx_Line("OK,CELL,%d,%s,%s", n, load_cells[active_cell].name, sbuf);
+
+    } else if (!strcmp(cmd, "SCALE")) {
+        float n_f, v;
+        if (argc < 3 || !Parse_Float(argv[1], &n_f) || !Parse_Float(argv[2], &v)) {
+            Tx_Line("ERR,SCALE,ARG");
+            return;
+        }
+        int n = (int)n_f;
+        if (n < 1 || n > NUM_CELLS) { Tx_Line("ERR,SCALE,RANGE"); return; }
+        cell_scale[n - 1] = v;
+        if (n - 1 == active_cell) { Apply_Scale(active_cell); Filter_Reset(); }
+        Fmt_Fixed(sbuf, sizeof(sbuf), v, 4);
+        Tx_Line("OK,SCALE,%d,%s", n, sbuf);
+
+    } else if (!strcmp(cmd, "CAL")) {
+        if (argc < 2) { Tx_Line("ERR,CAL,ARG"); return; }
+        if (!strcmp(argv[1], "ZERO")) {
+            int rc = Tare();
+            if (rc != TARE_OK) { cal_hold = 0; Tx_Line("ERR,CAL,%s", Tare_Reason(rc)); return; }
+            cal_hold = 1;
+            Tx_Line("OK,CAL,ZERO");
+        } else if (!strcmp(argv[1], "CANCEL")) {
+            cal_hold = 0;
+            Tx_Line("OK,CAL,CANCEL");
+        } else {
+            float grams;
+            if (!Parse_Float(argv[1], &grams) || grams <= 0.0f) { Tx_Line("ERR,CAL,BAD_ARG"); return; }
+            if (!cal_hold) { Tx_Line("ERR,CAL,ZERO_FIRST"); return; }
+            Calibrate(grams);
+        }
+
+    } else if (!strcmp(cmd, "STATUS")) {
+        Fmt_Fixed(sbuf, sizeof(sbuf), scale_cpg, 4);
+        Tx_Line("STATUS,%d,%lu,%d,%s,%d,%ld,%ld,%d", streaming, (unsigned long)interval_ms,
+                active_cell + 1, sbuf, autozero_on, (long)last_raw, (long)offset_counts, cal_hold);
+
+    } else {
+        Tx_Line("ERR,%s,UNKNOWN", cmd);
+    }
+}
+
+// Collects received bytes into lines and runs each complete line
+static void Poll_Serial(void) {
+    uint8_t c;
+    while (Rx_Get(&c)) {
+        if (c == '\r' || c == '\n') {
+            if (line_overflow) {
+                line_overflow = 0;
+                line_len = 0;
+                Tx_Line("ERR,LINE,TOO_LONG");
+            } else if (line_len > 0) {
+                line_buf[line_len] = '\0';
+                line_len = 0;
+                Process_Line(line_buf);
+            }
+        } else if (line_len < LINE_MAX_LEN - 1) {
+            line_buf[line_len++] = (char)c;
+        } else {
+            line_overflow = 1;
+        }
     }
 }
 /* USER CODE END 0 */
@@ -509,66 +588,68 @@ int main(void)
   // Make sure SCK starts low
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
 
-  // Give the USB port 1 second to connect to the PC before spamming data
+  // Give the USB port 1 second to connect to the PC before sending anything
   HAL_Delay(1000);
 
-  // Pick the default load cell and zero it (load cell must be empty at power-up)
-  Select_Cell(DEFAULT_CELL);
+  // Start with the default load cell and zero it (load cell must be empty at power-up)
+  for (int i = 0; i < NUM_CELLS; i++) cell_scale[i] = load_cells[i].counts_per_gram;
+  active_cell = DEFAULT_CELL;
+  Apply_Scale(active_cell);
+  Tare();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // Until the first key press, remind the user how to open the menu.
-    // (The terminal may have been opened after the board booted, so a
-    // one-time message at startup could be missed.)
+    // Until the first command arrives, remind whoever is listening (a terminal
+    // opened after the board booted would otherwise miss a one-time message).
     static uint32_t last_hint = 0;
-    if (!menu_shown && (HAL_GetTick() - last_hint) >= 2000) {
+    if (!got_command && (HAL_GetTick() - last_hint) >= 2000) {
         last_hint = HAL_GetTick();
-        printf("Load cell reader ready. Press any key for the menu.\r\n");
+        Tx_Line("# Load cell reader v%s ready. Type HELP and press Enter.", FW_VERSION);
     }
 
-    // Handle any keys typed in the terminal
-    uint8_t key;
-    while (Rx_Get(&key)) {
-        Handle_Key(key);
-    }
+    // Run any commands received from the PC
+    Poll_Serial();
 
     // One HX711 sample (blocks until ready: ~10 Hz with the default RATE pin)
     int32_t raw;
     if (!HX711_Read(&raw)) {
-        printf("HX711 timeout\r\n");
+        static uint32_t last_warn = 0;
+        if ((HAL_GetTick() - last_warn) >= 2000) {
+            last_warn = HAL_GetTick();
+            Tx_Line("W,HX711_TIMEOUT");
+        }
         continue;
     }
+    last_raw = raw;
 
     float filtered = Filter_Update(raw);
     float force_N  = Force_Compute(filtered);
-    last_raw      = raw;
-    last_filtered = filtered;
 
-#if AUTO_ZERO_ENABLE
     // Zero tracking: if the reading is very close to zero, assume it's drift
-    // and let the offset slowly follow it.
-    if (absf_(force_N) < AUTO_ZERO_WINDOW_N) {
+    // and let the offset slowly follow it. Frozen during a calibration.
+    if (autozero_on && !cal_hold && absf_(force_N) < AUTO_ZERO_WINDOW_N) {
         offset_counts += AUTO_ZERO_RATE * (filtered - offset_counts);
         force_N = Force_Compute(filtered);
     }
-#endif
 
-    // Deadband: print a clean zero when unloaded
+    // Deadband: report a clean zero when unloaded
     if (absf_(force_N) < ZERO_DEADBAND_N) {
         force_N = 0.0f;
     }
 
-    // Print without float printf (needs a linker flag on STM32CubeIDE):
-    // convert to millinewtons and format manually.
-    // (Readings are always filtered/zero-tracked, but only printed when streaming.)
-    if (streaming && (HAL_GetTick() - last_print_ms) >= PRINT_INTERVAL_MS) {
+    // The +20 ms tolerance keeps a 100 ms interval from skipping every other sample
+    if (streaming && (HAL_GetTick() - last_print_ms + 20u) >= interval_ms) {
         last_print_ms = HAL_GetTick();
-        int32_t mN = (int32_t)(force_N * 1000.0f + (force_N >= 0 ? 0.5f : -0.5f));
-        long a = (mN < 0) ? -(long)mN : (long)mN;
-        printf("Force: %s%ld.%03ld N\r\n", (mN < 0) ? "-" : "", a / 1000, a % 1000);
+        if (raw >= HX711_SAT_HI || raw <= HX711_SAT_LO) {
+            Tx_Line("W,SATURATED");
+        } else {
+            char fbuf[24];
+            Fmt_Fixed(fbuf, sizeof(fbuf), force_N, 3);
+            Tx_Line("F,%lu,%s", (unsigned long)last_print_ms, fbuf);
+        }
     }
 
   /* USER CODE END WHILE */
